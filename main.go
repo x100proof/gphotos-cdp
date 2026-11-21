@@ -64,8 +64,8 @@ var (
 	devFlag         = flag.Bool("dev", false, "dev mode. we reuse the same session dir (/tmp/gphotos-cdp), so we don't have to auth at every run.")
 	downloadDirFlag = flag.String("dldir", "", "where to write the downloads. defaults to $HOME/Downloads/gphotos-cdp.")
 	profileFlag     = flag.String("profile", "", "like -dev, but with a user-provided profile dir")
-	fromFlag        = flag.String("from", "", "earliest date to sync (YYYY-MM-DD)")
-	toFlag          = flag.String("to", "", "latest date to sync (YYYY-MM-DD)")
+	fromFlag        = flag.String("from", "", "earliest date to sync (YYYY-MM-DD, local time; set TZ)")
+	toFlag          = flag.String("to", "", "latest date to sync (YYYY-MM-DD, local time; set TZ)")
 	untilFlag       = flag.String("until", "", "stop syncing at this photo")
 	runFlag         = flag.String("run", "", "the program to run on each downloaded item, right after it is dowloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
 	verboseFlag     = flag.Bool("v", false, "be verbose")
@@ -139,15 +139,17 @@ func main() {
 
 	if *fromFlag != "" {
 		var err error
-		fromDate, err = time.Parse(time.DateOnly, *fromFlag)
+		// Local midnight, not UTC: photo dates carry their own zone and are compared as instants,
+		// so a UTC midnight would skip early-morning photos east of UTC (e.g. before 10:00 in UTC+10).
+		fromDate, err = time.ParseInLocation(time.DateOnly, *fromFlag, time.Local)
 		if err != nil {
 			log.Fatal().Msgf("could not parse -from argument %s, must be YYYY-MM-DD", *fromFlag)
 		}
 	}
 	if *toFlag != "" {
 		var err error
-		toDate, err = time.Parse(time.DateOnly, *toFlag)
-		toDate = toDate.Add(time.Hour * 24)
+		toDate, err = time.ParseInLocation(time.DateOnly, *toFlag, time.Local)
+		toDate = toDate.AddDate(0, 0, 1) // next local midnight (not +24h, which is wrong on DST days)
 		if err != nil {
 			log.Fatal().Msgf("could not parse -to argument %s, must be YYYY-MM-DD", *toFlag)
 		}
