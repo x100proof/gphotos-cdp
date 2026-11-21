@@ -64,8 +64,8 @@ var (
 	devFlag         = flag.Bool("dev", false, "dev mode. we reuse the same session dir (/tmp/gphotos-cdp), so we don't have to auth at every run.")
 	downloadDirFlag = flag.String("dldir", "", "where to write the downloads. defaults to $HOME/Downloads/gphotos-cdp.")
 	profileFlag     = flag.String("profile", "", "like -dev, but with a user-provided profile dir")
-	fromFlag        = flag.String("from", "", "earliest date to sync (YYYY-MM-DD, local time; set TZ)")
-	toFlag          = flag.String("to", "", "latest date to sync (YYYY-MM-DD, local time; set TZ)")
+	fromFlag        = flag.String("from", "", "earliest date to sync (YYYY-MM-DD), compared with each photo's own date as shown in Google Photos")
+	toFlag          = flag.String("to", "", "latest date to sync (YYYY-MM-DD), compared with each photo's own date as shown in Google Photos")
 	untilFlag       = flag.String("until", "", "stop syncing at this photo")
 	runFlag         = flag.String("run", "", "the program to run on each downloaded item, right after it is dowloaded. It is also the responsibility of that program to remove the downloaded item, if desired.")
 	verboseFlag     = flag.Bool("v", false, "be verbose")
@@ -139,17 +139,14 @@ func main() {
 
 	if *fromFlag != "" {
 		var err error
-		// Local midnight, not UTC: photo dates carry their own zone and are compared as instants,
-		// so a UTC midnight would skip early-morning photos east of UTC (e.g. before 10:00 in UTC+10).
-		fromDate, err = time.ParseInLocation(time.DateOnly, *fromFlag, time.Local)
+		fromDate, err = time.Parse(time.DateOnly, *fromFlag) // a calendar date; see photoDay
 		if err != nil {
 			log.Fatal().Msgf("could not parse -from argument %s, must be YYYY-MM-DD", *fromFlag)
 		}
 	}
 	if *toFlag != "" {
 		var err error
-		toDate, err = time.ParseInLocation(time.DateOnly, *toFlag, time.Local)
-		toDate = toDate.AddDate(0, 0, 1) // next local midnight (not +24h, which is wrong on DST days)
+		toDate, err = time.Parse(time.DateOnly, *toFlag) // a calendar date; see photoDay
 		if err != nil {
 			log.Fatal().Msgf("could not parse -to argument %s, must be YYYY-MM-DD", *toFlag)
 		}
@@ -1520,9 +1517,9 @@ func (s *Session) downloadAndProcessItem(ctx context.Context, log zerolog.Logger
 		data, err := s.getPhotoData(ctx, log, imageId)
 		if err != nil {
 			errChan <- err
-		} else if fromDate != (time.Time{}) && data.date.Before(fromDate) {
+		} else if beforeFromDate(data.date) {
 			errChan <- errPhotoTakenBeforeFromDate
-		} else if toDate != (time.Time{}) && data.date.After(toDate) {
+		} else if afterToDate(data.date) {
 			errChan <- errPhotoTakenAfterToDate
 		} else {
 			errChan <- nil
@@ -2460,6 +2457,26 @@ var yearRegex = regexp.MustCompile(`\d{4}`)
 var dayRegex = regexp.MustCompile(`\d{1,2}`)
 var timeRegex = regexp.MustCompile(`(\d{1,2}):(\d\d)(?::\d\d)?.?([aApP]\.?[Mm]\.?)?$`)
 var timeZoneRegex = regexp.MustCompile(`GMT([-+])?(\d{1,2})(?::(\d\d))?`)
+
+// photoDay returns the calendar date of t in t's own time zone (the date Google Photos shows for
+// the photo, since parseDate builds it in the photo's zone), as a UTC midnight comparable with
+// the -from/-to dates. Comparing calendar dates rather than instants makes -from/-to independent
+// of the machine's time zone: "-from 2026-10-01" means every photo Google shows as 1 Oct or later,
+// wherever it was taken.
+func photoDay(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+// beforeFromDate reports whether a photo taken at t is dated before -from (false without -from).
+func beforeFromDate(t time.Time) bool {
+	return !fromDate.IsZero() && photoDay(t).Before(fromDate)
+}
+
+// afterToDate reports whether a photo taken at t is dated after -to (false without -to).
+func afterToDate(t time.Time) bool {
+	return !toDate.IsZero() && photoDay(t).After(toDate)
+}
 
 func parseDate(dateStr, timeStr, tzStr string) (time.Time, error) {
 	var year, month, day, hour, minute int
