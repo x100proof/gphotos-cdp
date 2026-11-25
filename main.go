@@ -77,7 +77,13 @@ var (
 	albumIdFlag     = flag.String("album", "", "ID of album to download, has no effect if lastdone file is found or if -start contains full URL")
 	albumTypeFlag   = flag.String("albumtype", "album", "type of album to download (as seen in URL), has no effect if lastdone file is found or if -start contains full URL")
 	batchSizeFlag   = flag.Int("batchsize", 0, "number of photos to download in one batch")
-	execPathFlag    = flag.String("execpath", "", "path to Chrome/Chromium binary to use")
+	// Backfill in chunks without re-scrolling the whole library each run (x100proof fork).
+	resumeFlag        = flag.String("resume", "", "with -n: file saying where the previous -n run stopped (\"<time>\\t<photoId>\" or \"end\"). The run jumps straight there instead of scrolling past downloaded photos, and rewrites the file when it stops. Missing or empty: start at the newest photo")
+	retryFlag         = flag.String("retry", "", "file of photo ids (one per line) to download first, opening each one directly (e.g. the -missed list of the previous run)")
+	missedFlag        = flag.String("missed", "", "write the ids this run tried but did not download (pass it to -retry next run)")
+	stopAfterDoneFlag = flag.Int("stop-after-done", 0, "stop after this many consecutive already-downloaded photos (a quick pass for new photos at the top)")
+	jumpOvershootFlag = flag.Int("jump-overshoot", 0, "testing: after the -resume jump, scroll this many screens further down, to check that an overshoot is caught and corrected")
+	execPathFlag      = flag.String("execpath", "", "path to Chrome/Chromium binary to use")
 )
 
 const gphotosUrl = "https://photos.google.com"
@@ -120,6 +126,9 @@ func main() {
 	}
 	if *devFlag && *profileFlag != "" {
 		log.Fatal().Msg("only one of -dev and -profile can be used")
+	}
+	if *resumeFlag != "" && *nItemsFlag <= 0 {
+		log.Fatal().Msg("-resume needs -n")
 	}
 	if *albumIdFlag != "" && (*fromFlag != "" || *toFlag != "") {
 		log.Fatal().Msg("-from and -to cannot be used with -album")
@@ -237,6 +246,8 @@ type Session struct {
 	downloadedItems  sync.Map
 	newDownloadChan  chan NewDownload
 	skippedCount     atomic.Uint64
+	notDownloadable  sync.Map // ids Google can't serve (old highlight videos); never "missed"
+	retryIds         sync.Map // ids queued from -retry: a failure skips the photo, not the run
 }
 
 func NewSession() (*Session, error) {
@@ -1777,6 +1788,43 @@ func (s *Session) resync(ctx context.Context) error {
 
 	listenNavEvents(ctx)
 
+	// -resume: jump to just above where the previous -n run stopped.
+	jumped := false
+	var resumeTarget time.Time // the resume point's time (photos strictly newer were done)
+	resumeAtIn, resumeIdIn := "", ""
+	resumeWide := false
+	if *resumeFlag != "" {
+		at, id, wide, err := readResume(*resumeFlag)
+		if err != nil {
+			return err
+		}
+		if at != "" && at != "end" {
+			resumeAtIn, resumeIdIn, resumeWide = at, id, wide
+			resumeTarget, _ = time.Parse(resumeTimeLayout, at)
+			if wide {
+				// The previous scan may have landed below its resume photo: start a margin higher.
+				resumeTarget = resumeTarget.Add(wideMargin)
+				log.Info().Msgf("wide resume: jumping %s above %s, to rescan a possible gap", wideMargin, at)
+			}
+			at = resumeTarget.Format(resumeTimeLayout)
+			if err := s.jumpAbove(ctx, at); err != nil {
+				return fmt.Errorf("jumping to resume point %s: %w", at, err)
+			}
+			if *jumpOvershootFlag != 0 {
+				log.Warn().Msgf("-jump-overshoot: scrolling %d screen(s) further down on purpose", *jumpOvershootFlag)
+				if err := scrollScreens(ctx, *jumpOvershootFlag); err != nil {
+					return err
+				}
+			}
+			if err := s.verifyAbove(ctx, at); err != nil {
+				return err
+			}
+			jumped = true
+		} else {
+			log.Info().Msgf("no resume point in %s (%q), starting at the newest photo", *resumeFlag, at)
+		}
+	}
+
 	lastNode := &cdp.Node{}
 	lastImageId := "" // stable identity for lastNode — survives Google's virtualized list unmount/remount
 	var nodes []*cdp.Node
@@ -1787,6 +1835,18 @@ func (s *Session) resync(ctx context.Context) error {
 	sliderPos := 0.0
 	estimatedRemaining := 1000
 	photoNodeSelector := s.getPhotoNodeSelector()
+	var tried []string               // ids queued this run (for -missed)
+	retryQueued := map[string]bool{} // ids queued from -retry (only the scan goroutine uses it)
+	scannedNew := 0                  // new photos queued by the scan (for -n; -retry ones don't count)
+	doneStreak := 0                  // consecutive already-downloaded photos (for -stop-after-done)
+	var lastSeen time.Time           // time of the latest thumbnail with a readable label (for -resume)
+	resumeAt := ""                   // what to write to -resume when the run ends
+	scanChecked := !jumped           // after a jump: has the first dated photo scanned been checked?
+	metResumeId := false             // after a jump: did the scan meet the photo the previous chunk stopped at?
+	anchorLost := 0                  // consecutive batches whose scroll anchor was lost (the scan isn't advancing)
+	if *missedFlag != "" {
+		defer func() { s.writeMissed(tried) }()
+	}
 
 	log.Trace().Msgf("finding start node")
 	opts := []chromedp.QueryOption{chromedp.ByQuery, chromedp.AtLeast(0)}
@@ -1917,6 +1977,33 @@ func (s *Session) resync(ctx context.Context) error {
 		}
 	}(ctx)
 
+	// -retry: photos the previous run tried but didn't get; open each directly.
+	if *retryFlag != "" {
+		ids, err := readIdList(*retryFlag)
+		if err != nil {
+			return err
+		}
+		queuedRetries := 0
+		for _, id := range ids {
+			if has, err := hasFileOnDisk(s.downloadDir, id); err != nil {
+				return err
+			} else if has {
+				continue
+			}
+			retryQueued[id] = true // the scan won't queue it a second time
+			s.retryIds.Store(id, struct{}{})
+			tried = append(tried, id)
+			select {
+			case err := <-s.globalErrChan:
+				return err
+			case jobChan <- Job{[]string{id}}:
+			}
+			newItemsCount.Add(1)
+			queuedRetries++
+		}
+		log.Info().Msgf("queued %d photo(s) from -retry %s", queuedRetries, *retryFlag)
+	}
+
 syncAllLoop:
 	for {
 		if retries%5 == 0 {
@@ -1936,7 +2023,12 @@ syncAllLoop:
 		}
 
 		// New new nodes found, does it look like we are done?
-		if retries > 5000 || (retries > 100 && estimatedRemaining < 50) {
+		// (After a -resume jump n only counts photos since the jump, so require the real end.)
+		if retries > 5000 || (retries > 100 && estimatedRemaining < 50 && (!jumped || sliderPos > 0.995)) {
+			if *nItemsFlag > 0 && sliderPos > 0.995 {
+				resumeAt = "end"
+				log.Info().Msg("reached the end of the library")
+			}
 			break
 		}
 
@@ -2019,6 +2111,12 @@ syncAllLoop:
 			log.Trace().Msgf("%d nodes on page, processing %d that haven't been processed yet", foundNodes, len(nodes))
 			if !sliced && foundNodes == len(nodes) {
 				log.Warn().Msg("scroll anchor not found by NodeID or imageId — processing full query (isNewItem will filter duplicates)")
+				// Normally rare; many in a row means the scan keeps re-reading the same photos.
+				if anchorLost++; anchorLost >= 20 {
+					return fmt.Errorf("scroll anchor lost %d times in a row: the scan is not advancing", anchorLost)
+				}
+			} else {
+				anchorLost = 0
 			}
 
 			retries = 0
@@ -2043,21 +2141,67 @@ syncAllLoop:
 				foundUntil = true
 				break
 			}
+			if t, ok := labelTime(lastNode.AttributeValue("aria-label")); ok {
+				// Second check of the jump, on what the scan really processes: its first dated
+				// photo must be newer than the resume point, or photos in between were skipped.
+				if !scanChecked {
+					scanChecked = true
+					if !t.After(resumeTarget) {
+						return fmt.Errorf("after the -resume jump the first photo scanned (%s, %s) is not newer than the jump target %s: photos in between would be missed; -resume file left unchanged", imageId, t.Format(resumeTimeLayout), resumeTarget.Format(resumeTimeLayout))
+					}
+					log.Info().Msgf("first photo scanned after the jump: %s (%s), newer than the resume point", imageId, t.Format(resumeTimeLayout))
+				}
+				lastSeen = t
+			}
+			if jumped && !metResumeId && resumeIdIn != "" && imageId == resumeIdIn {
+				metResumeId = true
+				log.Info().Msgf("reached the photo the previous chunk stopped at (%s): the chunks join up", imageId)
+			}
 
 			log := log.With().Str("itemId", imageId).Logger()
 
 			shouldDownload, err := s.isNewItem(log, imageId, false)
+			if retryQueued[imageId] {
+				shouldDownload = false // already queued from -retry (not via foundItems: the worker would skip it)
+			}
 			if err != nil {
 				return err
 			} else if !shouldDownload {
+				doneStreak++
+				if *stopAfterDoneFlag > 0 && doneStreak >= *stopAfterDoneFlag {
+					log.Info().Msgf("%d already-downloaded photos in a row, stopping sync here (-stop-after-done)", doneStreak)
+					foundUntil = true
+					break
+				}
 				if len(imageIds) > 0 {
 					break
 				} else {
 					continue
 				}
 			}
+			doneStreak = 0
+
+			if *nItemsFlag > 0 && scannedNew >= *nItemsFlag {
+				// This photo is the first one left for the next run. Its own label time, read
+				// live (thumbnails get their label only once rendered, so the queried nodes'
+				// labels lag behind), or else the latest one seen before it (newer, so the
+				// next run's jump still lands above it, only less precisely).
+				if t, ok := s.liveLabelTime(ctx, imageId); ok {
+					lastSeen = t
+				}
+				if lastSeen.IsZero() {
+					log.Warn().Msg("no readable thumbnail date seen, next -resume run starts at the newest photo")
+				} else {
+					resumeAt = lastSeen.Format(resumeTimeLayout) + "\t" + imageId
+				}
+				log.Info().Msgf("queued -n %d new photos, stopping sync here; next run resumes at %s (%s)", *nItemsFlag, imageId, lastSeen.Format(resumeTimeLayout))
+				foundUntil = true
+				break
+			}
+			scannedNew++
 
 			imageIds = append(imageIds, imageId)
+			tried = append(tried, imageId)
 		}
 
 		if len(imageIds) > 0 {
@@ -2086,12 +2230,34 @@ syncAllLoop:
 	}
 	close(jobChan)
 
+	var runErr error
 	for err := range s.globalErrChan {
 		if !errors.Is(err, errPhotoTakenBeforeFromDate) {
-			return err
+			runErr = err
+			break
 		}
 	}
-	return nil
+	if runErr == nil && jumped && resumeIdIn != "" && !metResumeId {
+		// The time-based jump may have landed below the photo the previous chunk stopped at
+		// (thumbnail times aren't strictly in timeline order). Don't move on: next run jumps a
+		// margin higher and rescans. If even that misses it, the photo was probably deleted.
+		if !resumeWide {
+			log.Warn().Msgf("never met the photo the previous chunk stopped at (%s): the jump may have skipped photos; keeping the resume point, the next run jumps %s higher to rescan", resumeIdIn, wideMargin)
+			resumeAt = resumeAtIn + "\t" + resumeIdIn + "\twide"
+		} else {
+			log.Warn().Msgf("never met the photo the previous chunk stopped at (%s) even with a wide jump: it was probably deleted; moving on", resumeIdIn)
+		}
+	}
+	if runErr == nil && *resumeFlag != "" {
+		if resumeAt == "" && scannedNew < *nItemsFlag {
+			return fmt.Errorf("scan stopped after %d new photos, before -n %d and before the end of the library; -resume file left unchanged", scannedNew, *nItemsFlag)
+		}
+		if err := writeFileAtomic(*resumeFlag, resumeAt+"\n"); err != nil {
+			return err
+		}
+		log.Info().Msgf("wrote resume point %q to %s", resumeAt, *resumeFlag)
+	}
+	return runErr
 }
 
 func (s *Session) isNewItem(log zerolog.Logger, imageId string, markFound bool) (bool, error) {
@@ -2144,6 +2310,7 @@ func (s *Session) downloadWorker(workerId int, jobs <-chan Job, resultChan chan<
 					if errors.Is(err, errStillProcessing) {
 						// Old highlight videos are no longer available
 						log.Info().Msg("skipping generated highlight video that Google cannot be downloaded")
+						s.notDownloadable.Store(imageId, struct{}{})
 						isConsecutive = false
 					} else if errors.Is(err, errCouldNotLoadPhoto) {
 						// Google's SPA hangs on certain photos (a Google bug).
@@ -2154,6 +2321,12 @@ func (s *Session) downloadWorker(workerId int, jobs <-chan Job, resultChan chan<
 						log.Warn().Err(err).Msg("skipping photo whose page failed to load — Google Photos rendering bug")
 						isConsecutive = false
 					}
+					downloadedItemId = ""
+				} else if _, isRetry := s.retryIds.Load(imageId); err != nil && isRetry && ctx.Err() == nil {
+					// A -retry id may be deleted or never loads: skip it (it stays on the
+					// missed list, given up after a few runs) rather than fail the run.
+					log.Warn().Err(err).Msg("could not download photo from -retry, skipping it")
+					isConsecutive = false
 					downloadedItemId = ""
 				} else if err != nil {
 					errChan <- err
